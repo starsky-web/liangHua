@@ -155,7 +155,7 @@ class StrategyConfig:
     """策略配置"""
     # 通用配置
     target_date: str = None
-    lookback_days: int = 120
+    lookback_days: int = 60      # 减少回看天数（原120）
 
     # ETF配置
     include_etf: bool = True  # 是否包含ETF
@@ -163,10 +163,10 @@ class StrategyConfig:
     include_mainboard_a: bool = True  # 是否包含主板A股
 
     # 第0层：基础过滤
-    min_price: float = 3.0
-    max_price: float = 200.0
-    min_avg_amount: float = 5e6  # 最小平均成交额
-    etf_min_avg_amount: float = 3e6  # ETF的最小平均成交额（ETF通常成交额较高）
+    min_price: float = 1.8        # 降低最低价格
+    max_price: float = 300.0      # 降低最高价格
+    min_avg_amount: float = 3e5   # 降低到30万元
+    etf_min_avg_amount: float = 1e5  # ETF降低到10万元
 
     # 第1层：低估值蓝筹股策略
     low_pe_max: float = 15.0
@@ -382,33 +382,52 @@ class TrendFollowingStrategy(Strategy):
         super().__init__("趋势向好股", config)
 
     def evaluate(self, code: str, df: pd.DataFrame, stock_score: StockScore) -> bool:
+        # 检查数据长度
+        if len(df) < 21:
+            stock_score.add_signal(
+                self.name,
+                SignalType.NEUTRAL,
+                0.0,
+                {"reason": "数据不足"}
+            )
+            return False
+
         df = df.copy()
         df["ma20"] = TechnicalIndicators.ma(df["close"], self.config.trend_ma_short)
         df["ma60"] = TechnicalIndicators.ma(df["close"], self.config.trend_ma_long)
         df["ma120"] = TechnicalIndicators.ma(df["close"], 120)
 
         last = df.iloc[-1]
-        close_20d_ago = df["close"].iloc[-21]
-        rise_20d = (df["close"].iloc[-1] / close_20d_ago - 1) * 100
 
-        avg_vol_20 = df["volume"].tail(20).mean()
-        avg_vol_60 = df["volume"].tail(60).mean()
-        volume_ratio = avg_vol_20 / avg_vol_60 if avg_vol_60 > 0 else 0
+        # 安全访问20天前的数据
+        idx_20d_ago = max(0, len(df) - 21)
+        close_20d_ago = df["close"].iloc[idx_20d_ago]
+        close_now = df["close"].iloc[-1]
+        rise_20d = (close_now / close_20d_ago - 1) * 100 if close_20d_ago > 0 else 0
+
+        avg_vol_20 = df["volume"].tail(min(20, len(df))).mean()
+        avg_vol_60 = df["volume"].tail(min(60, len(df))).mean()
+        volume_ratio = avg_vol_20 / avg_vol_60 if pd.notna(avg_vol_60) and avg_vol_60 > 0 else 0
 
         score = 0.0
         factors = {}
 
         # 多头排列评分
-        if last["close"] > last["ma60"] > last["ma120"]:
+        if pd.notna(last["ma60"]) and pd.notna(last["ma120"]) and last["close"] > last["ma60"] > last["ma120"]:
             score += 35
             factors["arrangement_score"] = 35
         else:
             factors["arrangement_score"] = 0
 
         # 均线向上评分
-        if df["ma20"].iloc[-1] > df["ma20"].iloc[-5]:
-            score += 25
-            factors["ma_direction_score"] = 25
+        if len(df) >= 5:
+            ma20_last = df["ma20"].iloc[-1]
+            ma20_5d_ago = df["ma20"].iloc[-5]
+            if pd.notna(ma20_last) and pd.notna(ma20_5d_ago) and ma20_last > ma20_5d_ago:
+                score += 25
+                factors["ma_direction_score"] = 25
+            else:
+                factors["ma_direction_score"] = 0
         else:
             factors["ma_direction_score"] = 0
 
@@ -515,6 +534,16 @@ class MacdKdjResonanceStrategy(Strategy):
         super().__init__("MACD+KDJ共振", config)
 
     def evaluate(self, code: str, df: pd.DataFrame, stock_score: StockScore) -> bool:
+        # 检查数据长度（需要至少3天来比较）
+        if len(df) < 3:
+            stock_score.add_signal(
+                self.name,
+                SignalType.NEUTRAL,
+                0.0,
+                {"reason": "数据不足"}
+            )
+            return False
+
         df = df.copy()
         df["dif"], df["dea"], df["macd_hist"] = TechnicalIndicators.macd(
             df["close"], self.config.macd_fast, self.config.macd_slow, self.config.macd_signal
@@ -525,39 +554,57 @@ class MacdKdjResonanceStrategy(Strategy):
 
         last = df.iloc[-1]
 
-        # MACD金叉判断
+        # MACD金叉判断（安全访问）
+        dif_last = df["dif"].iloc[-1]
+        dif_prev = df["dif"].iloc[-2] if len(df) >= 2 else df["dif"].iloc[-1]
+        dea_last = df["dea"].iloc[-1]
+        dea_prev = df["dea"].iloc[-2] if len(df) >= 2 else df["dea"].iloc[-1]
+
         macd_cross = (
-            df["dif"].iloc[-1] > df["dea"].iloc[-1] and
-            df["dif"].iloc[-2] <= df["dea"].iloc[-2]
+            pd.notna(dif_last) and pd.notna(dea_last) and
+            pd.notna(dif_prev) and pd.notna(dea_prev) and
+            dif_last > dea_last and dif_prev <= dea_prev
         )
 
-        # KDJ金叉判断
+        # KDJ金叉判断（安全访问）
+        k_last = df["k"].iloc[-1]
+        k_prev = df["k"].iloc[-2] if len(df) >= 2 else df["k"].iloc[-1]
+        d_last = df["d"].iloc[-1]
+        d_prev = df["d"].iloc[-2] if len(df) >= 2 else df["d"].iloc[-1]
+
         kdj_cross = (
-            df["k"].iloc[-1] > df["d"].iloc[-1] and
-            df["k"].iloc[-2] <= df["d"].iloc[-2] and
-            df["k"].iloc[-1] < 30 and df["d"].iloc[-1] < 30
+            pd.notna(k_last) and pd.notna(d_last) and
+            pd.notna(k_prev) and pd.notna(d_prev) and
+            k_last > d_last and k_prev <= d_prev and
+            k_last < 30 and d_last < 30
         )
 
         score = 0.0
         factors = {}
 
         # MACD金叉评分
-        if macd_cross:
-            score += 50
-            factors["macd_cross_score"] = 50
-        elif df["dif"].iloc[-1] > df["dea"].iloc[-1]:  # 已在多头
-            score += 30
-            factors["macd_cross_score"] = 30
+        if pd.notna(dif_last) and pd.notna(dea_last):
+            if macd_cross:
+                score += 50
+                factors["macd_cross_score"] = 50
+            elif dif_last > dea_last:  # 已在多头
+                score += 30
+                factors["macd_cross_score"] = 30
+            else:
+                factors["macd_cross_score"] = 0
         else:
             factors["macd_cross_score"] = 0
 
         # KDJ金叉评分
-        if kdj_cross:
-            score += 50
-            factors["kdj_cross_score"] = 50
-        elif df["k"].iloc[-1] > df["d"].iloc[-1]:  # 已在多头
-            score += 20
-            factors["kdj_cross_score"] = 20
+        if pd.notna(k_last) and pd.notna(d_last):
+            if kdj_cross:
+                score += 50
+                factors["kdj_cross_score"] = 50
+            elif k_last > d_last:  # 已在多头
+                score += 20
+                factors["kdj_cross_score"] = 20
+            else:
+                factors["kdj_cross_score"] = 0
         else:
             factors["kdj_cross_score"] = 0
 
@@ -659,11 +706,32 @@ class SmallcapGrowthStrategy(Strategy):
             )
             return False
 
-        close_60d_ago = df["close"].iloc[-61]
-        rise_60d = (df["close"].iloc[-1] / close_60d_ago - 1) * 100
+        # 检查数据长度，避免索引越界
+        if len(df) < 20:
+            stock_score.add_signal(
+                self.name,
+                SignalType.NEUTRAL,
+                0.0,
+                {"reason": "数据不足"}
+            )
+            return False
 
-        avg_vol_20 = df["volume"].tail(20).mean()
-        avg_price_60 = df["close"].tail(60).mean()
+        # 安全访问60天前的数据
+        idx_60d_ago = max(0, len(df) - 61)
+        if idx_60d_ago == 0:
+            # 数据不足60天，使用最早的数据
+            close_60d_ago = df["close"].iloc[0]
+        else:
+            close_60d_ago = df["close"].iloc[idx_60d_ago]
+
+        close_now = df["close"].iloc[-1]
+        if close_60d_ago > 0:
+            rise_60d = (close_now / close_60d_ago - 1) * 100
+        else:
+            rise_60d = 0
+
+        avg_vol_20 = df["volume"].tail(min(20, len(df))).mean()
+        avg_price_60 = df["close"].tail(min(60, len(df))).mean()
         last = df.iloc[-1]
 
         score = 0.0
@@ -679,7 +747,7 @@ class SmallcapGrowthStrategy(Strategy):
             factors["growth_score"] = 0
 
         # 成交活跃度评分
-        if avg_vol_20 > 5e5:
+        if pd.notna(avg_vol_20) and avg_vol_20 > 5e5:
             vol_score = min(avg_vol_20 / 1e6 * 30, 30)
             score += vol_score
             factors["volume_score"] = vol_score
@@ -774,7 +842,9 @@ class MultiStrategySelector:
         # 获取K线数据
         start, end = self._get_date_range()
         df = self.ds.get_stock_kdata(code, start, end)
-        if not self._check_data_quality(df, 120):
+        # 60个自然日约40个交易日，取1/3约20天，降低要求避免因短期停牌被过滤
+        min_required_days = max(self.cfg.lookback_days // 3, 20)
+        if not self._check_data_quality(df, min_required_days):
             stock_score.add_failed_filter("数据质量", "K线数据不足或异常")
             return stock_score
 
@@ -792,22 +862,32 @@ class MultiStrategySelector:
         return stock_score
 
     def batch_evaluate(self, stock_codes: List[str], stock_names: Dict[str, str] = None,
-                     progress_every: int = 50) -> List[StockScore]:
-        """批量评估股票"""
+                     progress_every: int = 50) -> Tuple[List[StockScore], Dict[str, int]]:
+        """
+        批量评估股票
+        返回：(通过基础过滤的结果, 失败原因统计)
+        """
         results = []
+        fail_reasons = {}  # 失败原因 -> 数量
 
         for i, code in enumerate(stock_codes, 1):
             name = stock_names.get(code, "") if stock_names else ""
 
             stock_score = self.evaluate_stock(code, name)
+
+            # 统计失败原因
+            if stock_score.failed_filters:
+                for reason in stock_score.failed_filters:
+                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+
             if stock_score.passed_filters:  # 至少通过基础过滤
                 results.append(stock_score)
 
             if i % progress_every == 0 or i == len(stock_codes):
                 passed = len([r for r in results if not r.failed_filters])
-                print(f"进度: [{i}/{len(stock_codes)}] 通过过滤: {passed}")
+                print(f"进度: [{i}/{len(stock_codes)}] 通过过滤: {passed}/{len(results)}")
 
-        return results
+        return results, fail_reasons
 
     def get_ranked_results(self, stock_scores: List[StockScore], top_n: int = 20) -> pd.DataFrame:
         """获取排序后的结果"""
@@ -949,7 +1029,7 @@ def get_auto_stock_codes(ds: DataSource, include_etf: bool = True,
 def main():
     # 创建配置
     config = StrategyConfig()
-    config.lookback_days = 150  # 增加回看天数
+    # lookback_days 已在配置中设置为60天
 
     # 获取用户输入
     stock_codes, top_n, include_etf = get_user_input()
@@ -975,10 +1055,23 @@ def main():
         print(f"\n开始评估 {len(stock_codes)} 只标的...\n")
 
         # 批量评估
-        stock_scores = selector.batch_evaluate(stock_codes, progress_every=100)
+        stock_scores, fail_reasons = selector.batch_evaluate(stock_codes, progress_every=100)
+
+        # 显示失败原因统计
+        if fail_reasons:
+            print("\n" + "="*80)
+            print("过滤失败原因统计")
+            print("="*80)
+            sorted_reasons = sorted(fail_reasons.items(), key=lambda x: x[1], reverse=True)
+            for reason, count in sorted_reasons:
+                print(f"  {reason}: {count} 只 ({count/len(stock_codes)*100:.1f}%)")
 
         if not stock_scores:
             print("\n没有标的通过基础过滤")
+            print("\n建议：")
+            print("  1. 降低成交额阈值 (min_avg_amount)")
+            print("  2. 扩大价格范围 (min_price, max_price)")
+            print("  3. 减少回看天数 (lookback_days)")
             return
 
         # 获取排序结果
