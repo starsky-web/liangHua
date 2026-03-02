@@ -478,6 +478,9 @@ def evaluate_strategies(ind: Dict, market_stats: Dict) -> List[str]:
 
 def filter_mainboard_stocks(df: pd.DataFrame) -> pd.DataFrame:
     """过滤主板A股（60/00开头），排除科创板/创业板/北交所等"""
+    if df.empty or "code" not in df.columns:
+        return df
+
     def is_mainboard(code: str) -> bool:
         if not isinstance(code, str):
             return False
@@ -576,6 +579,16 @@ def main():
         # 过滤主板A股
         stock_list = filter_mainboard_stocks(stock_list)
         print(f"主板A股数量: {len(stock_list)}")
+
+        if stock_list.empty:
+            print(f"\n错误: 未获取到 {trade_day} 的股票数据")
+            print("可能原因:")
+            print("  1. 该日期是未来日期或非交易日")
+            print("  2. 当天数据尚未更新（baostock通常在收盘后更新）")
+            print("  3. 网络连接问题")
+            print("\n建议: 尝试指定一个过去的交易日，例如:")
+            print('  python screen.py --date 2025-02-28')
+            return
 
         # 获取股票基础信息
         print("正在获取股票基础信息...")
